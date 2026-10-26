@@ -22,6 +22,12 @@ type Reporter interface {
 	Send(ctx context.Context, r adsb.Report) error
 }
 
+// EventEmitter reports a leg's lifecycle events (departure/arrival) to
+// Operations. *ops.Client satisfies it; nil disables emission.
+type EventEmitter interface {
+	Emit(ctx context.Context, runID, eventType, aircraftID string, occurredAt time.Time) error
+}
+
 type tickMessage struct {
 	RunID       string    `json:"run_id"`
 	TickID      int64     `json:"tick_id"`
@@ -35,12 +41,16 @@ type Subscriber struct {
 	sub       *nats.Subscription
 	engine    *engine.Engine
 	reporter  Reporter
+	emitter   EventEmitter
 	log       *slog.Logger
 	onLanding func()
+
+	departed bool // guards against re-sending the departure event
 }
 
-// Connect dials NATS and subscribes to the tick subject. reporter may be nil.
-func Connect(url, subject string, eng *engine.Engine, reporter Reporter, log *slog.Logger, onLanding func()) (*Subscriber, error) {
+// Connect dials NATS and subscribes to the tick subject. reporter and emitter may
+// each be nil to disable that hop.
+func Connect(url, subject string, eng *engine.Engine, reporter Reporter, emitter EventEmitter, log *slog.Logger, onLanding func()) (*Subscriber, error) {
 	conn, err := nats.Connect(url,
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(time.Second),
@@ -55,14 +65,15 @@ func Connect(url, subject string, eng *engine.Engine, reporter Reporter, log *sl
 		return nil, fmt.Errorf("connect nats: %w", err)
 	}
 
-	s := &Subscriber{conn: conn, engine: eng, reporter: reporter, log: log, onLanding: onLanding}
+	s := &Subscriber{conn: conn, engine: eng, reporter: reporter, emitter: emitter, log: log, onLanding: onLanding}
 	sub, err := conn.Subscribe(subject, s.handle)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("subscribe %q: %w", subject, err)
 	}
 	s.sub = sub
-	log.Info("subscribed to ticks", "subject", subject, "url", conn.ConnectedUrl(), "reporting", reporter != nil)
+	log.Info("subscribed to ticks", "subject", subject, "url", conn.ConnectedUrl(),
+		"reporting", reporter != nil, "events", emitter != nil)
 	return s, nil
 }
 
@@ -92,10 +103,38 @@ func (s *Subscriber) handle(msg *nats.Msg) {
 	if res.Applied && s.reporter != nil {
 		s.report(tick, res.State, plan)
 	}
+	if res.Applied && s.emitter != nil {
+		s.emitLifecycle(tick.RunID, res, plan.AircraftID)
+	}
 	if res.Terminal && s.onLanding != nil {
 		s.log.Info("flight landed; final report delivered, shutting down",
 			"run_id", tick.RunID, "flight_id", plan.FlightID, "aircraft_id", plan.AircraftID)
 		s.onLanding()
+	}
+}
+
+// emitLifecycle sends a departure the first time the leg is airborne (or, if it
+// never reports flying, at arrival) and an arrival when the leg lands. occurred_at
+// is the applied tick's simulated time. Called only on applied ticks, which are
+// delivered serially, so the departed guard needs no locking.
+func (s *Subscriber) emitLifecycle(runID string, res engine.Result, aircraftID string) {
+	at := res.State.SimulatedAt
+	if !s.departed && (res.State.Status == flight.StatusFlying || res.Terminal) {
+		s.departed = true
+		s.emit(runID, "departure", aircraftID, at)
+	}
+	if res.Terminal {
+		s.emit(runID, "arrival", aircraftID, at)
+	}
+}
+
+func (s *Subscriber) emit(runID, eventType, aircraftID string, at time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.emitter.Emit(ctx, runID, eventType, aircraftID, at); err != nil {
+		// Observable, but does not change physical state.
+		s.log.Error("event delivery failed",
+			"run_id", runID, "type", eventType, "aircraft_id", aircraftID, "error", err)
 	}
 }
 

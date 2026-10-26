@@ -17,6 +17,7 @@ import (
 	"github.com/cloud-native-airlines/flight/internal/config"
 	"github.com/cloud-native-airlines/flight/internal/engine"
 	"github.com/cloud-native-airlines/flight/internal/httpapi"
+	"github.com/cloud-native-airlines/flight/internal/ops"
 	"github.com/cloud-native-airlines/flight/internal/ticks"
 )
 
@@ -50,13 +51,18 @@ func main() {
 		"arrival", cfg.Plan.Arrival.Format(time.RFC3339),
 	)
 
-	// Optional: subscribe to Simulator ticks on NATS and report to ADS-B.
+	// Optional: subscribe to Simulator ticks on NATS, report positions to ADS-B,
+	// and report lifecycle events to Operations.
 	if cfg.NATSURL != "" {
 		var reporter ticks.Reporter
 		if cfg.ADSBURL != "" {
 			reporter = adsb.New(cfg.ADSBURL, cfg.ReportTimeout, cfg.ReportRetries)
 		}
-		sub, err := ticks.Connect(cfg.NATSURL, cfg.TickSubject, eng, reporter, log, onLanding)
+		var emitter ticks.EventEmitter
+		if cfg.OperationsURL != "" {
+			emitter = ops.New(cfg.OperationsURL, cfg.FlightInstanceID, cfg.ReportTimeout, cfg.ReportRetries)
+		}
+		sub, err := ticks.Connect(cfg.NATSURL, cfg.TickSubject, eng, reporter, emitter, log, onLanding)
 		if err != nil {
 			log.Error("tick subscriber error", "error", err)
 			os.Exit(1)
